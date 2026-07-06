@@ -4,7 +4,7 @@ import Weather from './components/Weather';
 function App() {
   return (
     <div className="App">
-      <h1>Welcome to Weather App - Muraly</h1>
+      <h1>Welcome to Weather App - Muraly 2</h1>
       <Weather />
     </div>
   );
