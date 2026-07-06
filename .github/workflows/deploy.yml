@@ -1,0 +1,169 @@
+name: React CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build/CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Run tests
+        run: npm test -- --watchAll=false
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build
+          path: build/
+          retention-days: 7
+
+  # Runs whenever Build/CI succeeds - either a normal push to main, or the
+  # pull_request run GitHub triggers for the AI's fix/ai-* branch. Pushes to
+  # main deploy straight away under the "dev" environment. AI-fix branches
+  # deploy under "deploy-approval" instead, which should have a required
+  # reviewer configured in repo Settings -> Environments, so THIS job is
+  # where it actually pauses and waits for a human to click Approve.
+  deploy:
+    name: Deploy/CD
+    needs: build
+    if: success() && (github.ref == 'refs/heads/main' || startsWith(github.head_ref, 'fix/ai-'))
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'dev' || 'deploy-approval' }}
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: react-build
+          path: build
+
+      - name: Provision EC2 (install & start Nginx if missing)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            set -e
+            if ! command -v nginx >/dev/null 2>&1; then
+              echo "Nginx not found, installing..."
+              if command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y nginx
+              elif command -v yum >/dev/null 2>&1; then
+                if command -v amazon-linux-extras >/dev/null 2>&1; then
+                  sudo amazon-linux-extras install -y nginx1
+                else
+                  sudo yum install -y nginx
+                fi
+              elif command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update -y
+                sudo apt-get install -y nginx
+              else
+                echo "ERROR: no supported package manager (dnf/yum/apt-get) found" >&2
+                exit 1
+              fi
+            else
+              echo "Nginx already installed, skipping install."
+            fi
+            sudo mkdir -p /var/www/html
+            sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/www/html
+            sudo rm -f /etc/nginx/conf.d/default.conf /etc/nginx/sites-enabled/default
+            sudo mkdir -p /etc/nginx/conf.d
+            sudo tee /etc/nginx/conf.d/app.conf > /dev/null <<'NGINXCONF'
+            server {
+                listen 80 default_server;
+                server_name _;
+                root /var/www/html;
+                index index.html;
+                location / {
+                    try_files $uri /index.html;
+                }
+            }
+            NGINXCONF
+            if command -v ufw >/dev/null 2>&1; then
+              sudo ufw allow 'Nginx Full' || true
+            fi
+            sudo nginx -t
+            sudo systemctl enable nginx
+            sudo systemctl restart nginx
+            sudo systemctl is-active --quiet nginx && echo "Nginx is running" || { echo "ERROR: nginx failed to start" >&2; exit 1; }
+
+      - name: Copy build files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          source: 'build/*'
+          target: '/home/${{ secrets.EC2_USERNAME }}/app-deploy'
+          strip_components: 1
+
+      - name: Move files into Nginx web root and reload
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            sudo rm -rf /var/www/html/*
+            sudo cp -r /home/${{ secrets.EC2_USERNAME }}/app-deploy/* /var/www/html/
+            sudo systemctl reload nginx
+            rm -rf /home/${{ secrets.EC2_USERNAME }}/app-deploy
+
+  ai-fix:
+    needs: build
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install agent dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AI agent
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: python ai-agent/agent.py
+
+      - name: Upload agent report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-agent-report
+          path: ai-agent-report.html
+          if-no-files-found: ignore
+          retention-days: 7
